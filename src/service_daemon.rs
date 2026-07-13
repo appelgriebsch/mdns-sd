@@ -100,6 +100,18 @@ const ANNOUNCE_SECOND_JITTER_MILLIS: u64 = 50;
 #[allow(clippy::assertions_on_constants)]
 const _: () = assert!(ANNOUNCE_SECOND_DELAY_MILLIS > MULTICAST_RATE_LIMIT_MILLIS);
 
+/// RFC 6762 §6:
+/// In any case where there may be multiple responses, such as queries
+/// where the answer is a member of a shared resource record set, each
+/// responder SHOULD delay its response by a random amount of time
+/// selected with uniform random distribution in the range 20-120 ms.
+///
+/// 20ms suggested in the RFC is a bit too long for min. Use 10ms instead.
+const SHARED_RESPONSE_DELAY_MIN_MILLIS: u64 = 10;
+
+/// 120ms suggested in the RFC is too long for max, use 50ms instead.
+const SHARED_RESPONSE_DELAY_MAX_MILLIS: u64 = 50;
+
 /// Response status code for the service `unregister` call.
 #[derive(Debug)]
 pub enum UnregisterStatus {
@@ -891,6 +903,15 @@ struct ReRun {
     command: Command,
 }
 
+/// A query response deferred per RFC 6762 §6 (shared response).
+struct DelayedResponse {
+    /// UNIX timestamp in millis at which to send `out`.
+    next_time: u64,
+    out: DnsOutgoing,
+    if_index: u32,
+    is_ipv4: bool,
+}
+
 /// Specify kinds of interfaces. It is used to enable or to disable interfaces in the daemon.
 ///
 /// Note that for ergonomic reasons, `From<&str>` and `From<IpAddr>` are implemented.
@@ -1071,6 +1092,9 @@ struct Zeroconf {
 
     /// All repeating transmissions.
     retransmissions: Vec<ReRun>,
+
+    /// Query responses deferred per RFC 6762 §6.
+    delayed_responses: Vec<DelayedResponse>,
 
     counters: Metrics,
 
@@ -1277,6 +1301,7 @@ impl Zeroconf {
             hostname_resolvers: HashMap::new(),
             service_queriers: HashMap::new(),
             retransmissions: Vec::new(),
+            delayed_responses: Vec::new(),
             counters: HashMap::new(),
             poller,
             monitors,
@@ -1333,6 +1358,7 @@ impl Zeroconf {
     /// 2. Stops all active browse operations
     /// 3. Stops all active hostname resolution operations
     /// 4. Clears all retransmissions
+    /// 5. Drops all pending delayed responses
     fn cleanup(&mut self) {
         debug!("Starting cleanup for shutdown");
 
@@ -1389,6 +1415,9 @@ impl Zeroconf {
 
         // 4. Clear all retransmissions
         self.retransmissions.clear();
+
+        // 5. Drop any pending delayed responses
+        self.delayed_responses.clear();
 
         debug!("Cleanup completed");
     }
@@ -1509,6 +1538,17 @@ impl Zeroconf {
                 if now >= self.retransmissions[i].next_time {
                     let rerun = self.retransmissions.remove(i);
                     self.exec_command(rerun.command, true);
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Send delayed responses whose time is up (RFC 6762 §6).
+            let mut i = 0;
+            while i < self.delayed_responses.len() {
+                if now >= self.delayed_responses[i].next_time {
+                    let resp = self.delayed_responses.remove(i);
+                    self.send_delayed_response(resp);
                 } else {
                     i += 1;
                 }
@@ -3186,7 +3226,9 @@ impl Zeroconf {
             debug!("handle_query: socket not available for intf {}", if_index);
             return;
         };
+
         let mut out = DnsOutgoing::new(FLAGS_QR_RESPONSE | FLAGS_AA);
+        let mut delayed = false;
 
         // Special meta-query "_services._dns-sd._udp.<Domain>".
         // See https://datatracker.ietf.org/doc/html/rfc6763#section-9
@@ -3207,6 +3249,12 @@ impl Zeroconf {
             let q_name = question.entry_name();
 
             if qtype == RRType::PTR {
+                // PTR answers are shared records: defer the response unless this
+                // is a legacy-unicast (source port != 5353) or probe-defense
+                // (records in the Authority Section) query.
+                if querier_addr.port() == MDNS_PORT && msg.num_authorities() == 0 {
+                    delayed = true;
+                }
                 for service in self.my_services.values() {
                     if service.get_status(if_index) != ServiceStatus::Announced {
                         continue;
@@ -3324,6 +3372,23 @@ impl Zeroconf {
             }
         }
 
+        // Defer PTR responses (RFC 6762 §6).
+        if delayed && out.answers_count() > 0 {
+            out.set_id(msg.id());
+            self.increase_counter(Counter::KnownAnswerSuppression, out.known_answer_count());
+            let delay =
+                fastrand::u64(SHARED_RESPONSE_DELAY_MIN_MILLIS..SHARED_RESPONSE_DELAY_MAX_MILLIS);
+            let next_time = current_time_millis() + delay;
+            self.delayed_responses.push(DelayedResponse {
+                next_time,
+                out,
+                if_index,
+                is_ipv4,
+            });
+            self.add_timer(next_time);
+            return;
+        }
+
         if out.answers_count() > 0 {
             out.set_id(msg.id());
 
@@ -3384,6 +3449,57 @@ impl Zeroconf {
         }
 
         self.increase_counter(Counter::KnownAnswerSuppression, out.known_answer_count());
+    }
+
+    /// Multicasts a PTR query response that was deferred per RFC 6762 §6.
+    ///
+    /// Re-resolves the socket and interface from `if_index`, so it is safe to
+    /// call from the timer loop after the borrows taken while building the
+    /// response are gone. The original querier is no longer known, so the
+    /// response is always a plain multicast (no unicast destination, no
+    /// source-address preference); the §6 once-per-second multicast rate limit
+    /// still applies.
+    fn send_delayed_response(&mut self, resp: DelayedResponse) {
+        let DelayedResponse {
+            mut out,
+            if_index,
+            is_ipv4,
+            ..
+        } = resp;
+
+        let sock_opt = if is_ipv4 {
+            &self.ipv4_sock
+        } else {
+            &self.ipv6_sock
+        };
+        let Some(sock) = sock_opt.as_ref() else {
+            debug!("send_delayed_response: socket not available for intf {if_index}");
+            return;
+        };
+
+        if let Some(dns_registry) = self.dns_registry_map.get_mut(&if_index) {
+            dns_registry.apply_multicast_rate_limit(&mut out, current_time_millis(), is_ipv4);
+        }
+        if out.answers_count() == 0 {
+            return;
+        }
+
+        let Some(intf) = self.my_intfs.get(&if_index) else {
+            debug!("send_delayed_response: no intf found for index {if_index}");
+            return;
+        };
+
+        let if_name = intf.name.clone();
+        debug!("sending delayed response on intf {}", &if_name);
+        let send_result = send_dns_outgoing(&out, intf, &sock.pktinfo, self.port, None, None);
+
+        if let Err(InternalError::IntfAddrInvalid(intf_addr)) = send_result {
+            let invalid_intf_addr = HashSet::from([intf_addr]);
+            let _ = self.send_cmd_to_self(Command::InvalidIntfAddrs(invalid_intf_addr));
+        }
+
+        self.increase_counter(Counter::Respond, 1);
+        self.notify_monitors(DaemonEvent::Respond(if_name));
     }
 
     /// Increases the value of `counter` by `count`.
@@ -4891,8 +5007,9 @@ mod tests {
     use super::{
         _new_socket_bind, check_domain_suffix, check_service_name_length, hostname_change,
         my_ip_interfaces, name_change, send_dns_outgoing_impl, valid_instance_name,
-        valid_ip_on_intf, HostnameResolutionEvent, MyIntf, ServiceDaemon, ServiceEvent,
-        ServiceInfo, GROUP_ADDR_V4, MDNS_PORT,
+        valid_ip_on_intf, DaemonEvent, HostnameResolutionEvent, MyIntf, ServiceDaemon,
+        ServiceEvent, ServiceInfo, GROUP_ADDR_V4, MDNS_PORT, SHARED_RESPONSE_DELAY_MAX_MILLIS,
+        SHARED_RESPONSE_DELAY_MIN_MILLIS,
     };
     use crate::{
         dns_parser::{
@@ -5094,6 +5211,150 @@ mod tests {
         assert!(
             !answer.get_cache_flush(),
             "legacy unicast responses must clear the cache-flush bit"
+        );
+
+        daemon.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_shared_response_delay_bounds() {
+        // A shared-record (PTR) response is delayed by a uniform-random amount.
+        // We deviate from the RFC 6762 §6 suggested 20-120 ms window and use a
+        // shorter 10-50 ms delay (`MAX` is the exclusive upper bound, so the
+        // actual delay is 10..=49 ms).
+        assert_eq!(SHARED_RESPONSE_DELAY_MIN_MILLIS, 10);
+        assert_eq!(SHARED_RESPONSE_DELAY_MAX_MILLIS, 50);
+        for _ in 0..10_000 {
+            let d =
+                fastrand::u64(SHARED_RESPONSE_DELAY_MIN_MILLIS..SHARED_RESPONSE_DELAY_MAX_MILLIS);
+            assert!(
+                (SHARED_RESPONSE_DELAY_MIN_MILLIS..SHARED_RESPONSE_DELAY_MAX_MILLIS).contains(&d),
+                "delay {} ms is outside the configured {}-{} ms range",
+                d,
+                SHARED_RESPONSE_DELAY_MIN_MILLIS,
+                SHARED_RESPONSE_DELAY_MAX_MILLIS
+            );
+        }
+    }
+
+    #[test]
+    fn test_shared_ptr_response_delayed() {
+        // RFC 6762 §6: a PTR (shared record set) response sent by multicast is
+        // delayed by a uniform-random amount (we use a 10-50 ms window). Register
+        // a service, then as a proper multicast querier (source port 5353) send a
+        // PTR query and assert the daemon emits its response no sooner than ~10 ms
+        // after the query. (A legacy unicast querier gets an *immediate* response
+        // instead; see `test_legacy_unicast_response`.)
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let intf_ip = match my_ip_interfaces(false)
+            .into_iter()
+            .find_map(|intf| match intf.ip() {
+                IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
+                _ => None,
+            }) {
+            Some(ip) => ip,
+            None => {
+                println!("No IPv4 interface available; skipping test.");
+                return;
+            }
+        };
+
+        let daemon = ServiceDaemon::new().expect("Failed to create daemon");
+        let monitor = daemon.monitor().expect("monitor daemon events");
+
+        // Keep the service name (the `_sd…` label) within the 15-byte limit
+        // that RFC 6763 §7.2 imposes, while staying unique per run.
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros()
+            % 1_000_000_000;
+        let service_type = format!("_sd{unique}._udp.local.");
+        let hostname = format!("sd{unique}.local.");
+        let service_info = ServiceInfo::new(
+            &service_type,
+            "test_instance",
+            &hostname,
+            &[IpAddr::V4(intf_ip)] as &[IpAddr],
+            5353,
+            None,
+        )
+        .expect("invalid service info");
+        daemon.register(service_info).expect("register service");
+
+        // A proper multicast querier: source port 5353 so the daemon takes the
+        // shared-record (delayed) path rather than the legacy-unicast one. We only
+        // *send* on this socket; the response is observed through the monitor.
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        sock.set_reuse_address(true).unwrap();
+        #[cfg(unix)]
+        sock.set_reuse_port(true).unwrap();
+        sock.bind(&std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT)).into())
+            .unwrap();
+        sock.set_multicast_if_v4(&intf_ip).unwrap();
+        // Loop the query back to the daemon's socket on this same host.
+        sock.set_multicast_loop_v4(true).unwrap();
+        let sock: UdpSocket = sock.into();
+
+        // Build the PTR query for our service type.
+        let mut query = DnsOutgoing::new(FLAGS_QR_QUERY);
+        query.add_question(&service_type, RRType::PTR);
+        let query_packet = query.to_data_on_wire().pop().expect("one packet");
+
+        // Wait for the initial announcements and the §6 rate-limit window (1s) to
+        // pass, so our query elicits a fresh (delayed) response instead of being
+        // suppressed by the rate limiter.
+        std::thread::sleep(Duration::from_secs(3));
+
+        // Retry until the daemon emits a Respond for our query. A query landing
+        // inside the 1 s multicast rate-limit window is rate-limited to an empty
+        // response (no send, no event), so we simply re-query on the next pass.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut measured = None;
+        while Instant::now() < deadline {
+            // Drop any Respond events queued earlier so we time only the response
+            // to the query we are about to send.
+            while monitor.try_recv().is_ok() {}
+
+            let sent_at = Instant::now();
+            sock.send_to(&query_packet, (GROUP_ADDR_V4, MDNS_PORT))
+                .expect("send query");
+
+            // The delay window is 10-50 ms; 700 ms comfortably covers it plus any
+            // scheduling slack. Ignore unrelated events; on timeout, re-query.
+            let attempt_deadline = sent_at + Duration::from_millis(700);
+            loop {
+                let remaining = attempt_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match monitor.recv_timeout(remaining) {
+                    Ok(DaemonEvent::Respond(_)) => {
+                        measured = Some(sent_at.elapsed());
+                        break;
+                    }
+                    Ok(_) => continue, // some other daemon event; keep waiting
+                    Err(_) => break,   // timed out; re-query
+                }
+            }
+            if measured.is_some() {
+                break;
+            }
+        }
+
+        let elapsed =
+            measured.expect("expected the daemon to respond to our PTR query within the deadline");
+        assert!(
+            elapsed >= Duration::from_millis(8),
+            "PTR response was sent after only {:?}; a shared-record response must be \
+             delayed (10-50 ms window), not sent immediately",
+            elapsed
+        );
+        assert!(
+            elapsed <= Duration::from_millis(600),
+            "PTR response was sent after {:?}; expected within the 10-50 ms delay window",
+            elapsed
         );
 
         daemon.shutdown().unwrap();
